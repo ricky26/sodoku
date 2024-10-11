@@ -248,6 +248,7 @@ dependencies = [
  "bitvec",
  "clap",
  "nom",
+ "smallvec",
  "tracing",
  "tracing-subscriber",
 ]

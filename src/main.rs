@@ -4,10 +4,11 @@ use clap::Parser;
 use nom::combinator::fail;
 use nom::error::context;
 use nom::{Finish, IResult};
+use smallvec::SmallVec;
 use std::fmt::{Debug, Display, Formatter};
 use std::io::{stdin, Read};
 use std::ops::{Deref, DerefMut};
-use tracing::{debug, error};
+use tracing::{error, trace};
 
 #[derive(Clone, Copy, Debug, PartialOrd, Ord, PartialEq, Eq)]
 pub enum Validity {
@@ -161,14 +162,19 @@ impl SubGrid {
         Self::cell_index(x, y).map(|i| &mut self.cells[i])
     }
 
-    pub fn prune(&mut self, sub_grid: &PossibilitySet, rows: &[PossibilitySet], cols: &[PossibilitySet]) {
+    pub fn prune(&mut self, sub_grid: &PossibilitySet, rows: &[PossibilitySet], cols: &[PossibilitySet]) -> bool {
+        let mut ok = true;
         for (i, cell) in self.cells.iter_mut().enumerate() {
             let row = i / 3;
             let col = i - (row * 3);
             if let GridCell::Unsolved(ref mut set) = cell {
                 *set.0 &= cols[col].0 & rows[row].0 & sub_grid.0;
+                if set.0.first_one().is_none() {
+                    ok = false;
+                }
             }
         }
+        ok
     }
 
     pub fn validate(&self) -> (Validity, PossibilitySet) {
@@ -246,24 +252,19 @@ impl Grid {
     }
 
     pub fn solve(&mut self) -> Validity {
-        type Stack = Vec<(Grid, Vec<(usize, usize, PossibilitySet)>)>;
+        type Stack = Vec<(Grid, usize, usize, PossibilitySet)>;
         let mut stack: Stack = Vec::new();
 
         let pop_stack = |stack: &mut Stack, grid: &mut Grid| {
-            if let Some((saved_grid, mut possibilities)) = stack.pop() {
-                let (x, y, mut set) = possibilities.pop().unwrap();
+            if let Some((saved_grid, x, y, mut set)) = stack.pop() {
                 let v = set.first_one().unwrap() + 1;
-                debug!("[{}] trying {x},{y}={v} ({})", stack.len(), set.count_ones());
                 set.set(v - 1, false);
                 grid.copy_from(&saved_grid);
                 *grid.cell_mut(x, y).unwrap() = GridCell::Solved(v as u8);
+                trace!("[{}] trying {x},{y}={v} ({})\n{grid}", stack.len(), set.count_ones() + 1);
 
                 if !set.first_one().is_none() {
-                    possibilities.push((x, y, set));
-                }
-
-                if !possibilities.is_empty() {
-                    stack.push((saved_grid, possibilities));
+                    stack.push((saved_grid, x, y, set));
                 }
 
                 true
@@ -273,12 +274,15 @@ impl Grid {
         };
 
         loop {
-            match self.check() {
+            let (validity, grid_possibilities) = self.check_prune();
+            match validity {
                 Validity::Complete => {
                     return Validity::Complete;
                 }
                 Validity::Incomplete => {}
                 Validity::Invalid => {
+                    trace!("invalid!\n{self:#?}\n{self}");
+
                     if pop_stack(&mut stack, self) {
                         continue;
                     }
@@ -289,33 +293,41 @@ impl Grid {
 
             let mut did_solve = false;
 
-            for cell in self.cells_mut() {
-                if let GridCell::Unsolved(set) = cell {
-                    if set.count_ones() == 1 {
-                        did_solve = true;
-                        *cell = GridCell::Solved((set.first_one().unwrap() + 1) as u8);
+            for (grid, mut mask) in self.sub_grids.iter_mut().zip(grid_possibilities) {
+                for cell in &mut grid.cells {
+                    if let GridCell::Unsolved(set) = cell {
+                        let masked = set.0 & mask.0;
+                        if masked.count_ones() == 1 {
+                            did_solve = true;
+                            let v = masked.first_one().unwrap();
+                            *cell = GridCell::Solved((v + 1) as u8);
+                            mask.set(v, false);
+                        }
                     }
                 }
             }
 
             if !did_solve {
-                let mut possibilities = Vec::new();
+                let mut next = None;
+                let mut max_possibilities = 10;
 
                 for y in 0..9 {
                     for x in 0..9 {
                         let cell = self.cell(x, y).unwrap();
                         if let GridCell::Unsolved(set) = cell {
-                            if set.first_one().is_some() {
-                                possibilities.push((x, y, set.clone()));
+                            assert!(set.first_one().is_some());
+                            let ones = set.count_ones();
+                            if ones < max_possibilities {
+                                max_possibilities = ones;
+                                next = Some((x, y, *set));
                             }
                         }
                     }
                 }
 
-                possibilities.sort_by_key(|(_, _, s)| -(s.len() as i64));
-                if !possibilities.is_empty() {
-                    stack.push((self.clone(), possibilities));
-                }
+                let Some((x, y, set)) = next else { unreachable!() };
+                trace!("next {x},{y} = {set:?}");
+                stack.push((self.clone(), x, y, set));
 
                 if pop_stack(&mut stack, self) {
                     continue;
@@ -323,21 +335,24 @@ impl Grid {
 
                 return Validity::Incomplete;
             }
+
+            trace!("solved some\n{self:#?}\n{self}");
         }
     }
 
-    fn prune_phase(iter: impl Iterator<Item=(Validity, PossibilitySet)>) -> (Validity, Vec<PossibilitySet>) {
-        iter.fold((Validity::Complete, Vec::with_capacity(9)), |(av, mut sets), (v, new_set)| {
+    fn prune_phase(iter: impl Iterator<Item=(Validity, PossibilitySet)>) -> (Validity, SmallVec<[PossibilitySet; 9]>) {
+        iter.fold((Validity::Complete, SmallVec::new()), |(av, mut sets), (v, new_set)| {
             sets.push(new_set);
             (av.and(v), sets)
         })
     }
 
-    pub fn check(&mut self) -> Validity {
+    fn check_prune(&mut self) -> (Validity, SmallVec<[PossibilitySet; 9]>) {
         let (vg, grids) = Self::prune_phase(self.sub_grids.iter().map(SubGrid::validate));
         let (vc, cols) = Self::prune_phase((0..9).map(|col| GridCell::validate(self.column(col))));
         let (vr, rows) = Self::prune_phase((0..9).map(|row| GridCell::validate(self.row(row))));
 
+        let mut validity = vg.and(vc).and(vr);
         for (index, grid) in self.sub_grids.iter_mut().enumerate() {
             let y = index / 3;
             let x = index - y * 3;
@@ -347,10 +362,16 @@ impl Grid {
             let col_range = col_start..(col_start + 3);
             let grid_rows = &rows[row_range];
             let grid_cols = &cols[col_range];
-            grid.prune(&grids[index], grid_rows, grid_cols);
+            if !grid.prune(&grids[index], grid_rows, grid_cols) {
+                validity = Validity::Invalid;
+            }
         }
 
-        vg.and(vc).and(vr)
+        (validity, grids)
+    }
+
+    pub fn check(&mut self) -> Validity {
+        self.check_prune().0
     }
 
     pub fn parse(src: &str) -> IResult<&str, Grid> {
