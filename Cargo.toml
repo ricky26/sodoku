@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.89"
 clap = { version = "4.5.20", features = ["derive"] }
-tracing = "0.1.40"
+tracing = { version = "0.1.40", features = ["release_max_level_info"] }
 tracing-subscriber = "0.3.18"
 nom = "7.1.3"
 bitvec = "1.0.1"

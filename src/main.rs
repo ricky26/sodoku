@@ -479,6 +479,6 @@ fn main() -> anyhow::Result<()> {
         println!("{:#?}", grid);
     }
 
-    println!("{}", grid);
+    println!("output:\n{}", grid);
     Ok(())
 }
